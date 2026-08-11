@@ -1,13 +1,13 @@
-name: Node.js App
+name: Build & Deploy to Koyeb
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 jobs:
-  run:
+  deploy:
     runs-on: ubuntu-latest
 
     steps:
@@ -22,8 +22,12 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Build project
+      - name: Build
         run: npm run build
 
-      - name: Start app
-        run: npm start
+      - name: Check build
+        run: |
+          echo "Build files:"
+          find dist -maxdepth 2 -type f 2>/dev/null || true
+
+      # Koyeb deployment goes here
