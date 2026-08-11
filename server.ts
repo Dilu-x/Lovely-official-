@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import zlib from 'zlib';
@@ -36,6 +37,33 @@ const HEADERS = {
 
 const ANILIST_URL = 'https://graphql.anilist.co';
 const MIRURO_PIPE_URL = 'https://www.miruro.tv/api/secure/pipe';
+
+// Episodes/sources/downloads go through the Miruro pipe, which is behind
+// Cloudflare and hard-blocks datacenter IPs (Vercel, Render, Cloud Run, etc.).
+// That's why episodes were failing here. The "lovely-anime-api" (api.py)
+// project uses curl_cffi browser-TLS impersonation and is meant to be hosted
+// on a VPS with a clean/residential IP, so we delegate all episode/source/
+// download work to it. Set ANIME_API_BASE_URL to wherever that service is
+// running (e.g. https://your-vps-host:8000). If it's not set/unreachable we
+// fall back to the old direct-Miruro logic below (which is what was broken).
+const PY_API_BASE = (process.env.ANIME_API_BASE_URL || process.env.PY_API_BASE || '').replace(/\/+$/, '');
+
+async function pyApiFetch(pathAndQuery: string): Promise<any> {
+  if (!PY_API_BASE) {
+    throw { status: 503, message: 'ANIME_API_BASE_URL is not configured' };
+  }
+  const response = await fetch(`${PY_API_BASE}${pathAndQuery}`);
+  if (!response.ok) {
+    let body = '';
+    try {
+      body = (await response.text()).substring(0, 500);
+    } catch {
+      // ignore
+    }
+    throw { status: response.status, message: `lovely-anime-api returned status ${response.status}`, body };
+  }
+  return response.json();
+}
 
 const MEDIA_LIST_FIELDS = `
     id
@@ -298,6 +326,49 @@ async function findEpisodeTarget(anilistId: number, provider: string, category: 
     }
   }
   throw { status: 404, message: `Episode slug '${slug}' not found for provider ${provider}` };
+}
+
+// --- lovely-anime-api backed helpers (primary path, with fallback to the
+// direct-Miruro functions above if the Python API isn't configured/reachable) ---
+
+async function fetchEpisodesWithSlugs(anilistId: number): Promise<any> {
+  if (PY_API_BASE) {
+    try {
+      return await pyApiFetch(`/episodes/${anilistId}`);
+    } catch (e: any) {
+      console.error(`[lovely-anime-api] episodes fetch failed for ${anilistId}, falling back to direct Miruro:`, e.message || e);
+    }
+  }
+  const raw = await fetchRawEpisodes(anilistId);
+  return injectSourceSlugs(raw, anilistId);
+}
+
+async function fetchSourcesForSlug(provider: string, anilistId: number, category: string, slug: string): Promise<any> {
+  if (PY_API_BASE) {
+    try {
+      return await pyApiFetch(`/watch/${provider}/${anilistId}/${category}/${slug}`);
+    } catch (e: any) {
+      console.error(`[lovely-anime-api] watch fetch failed for ${anilistId}/${provider}/${slug}, falling back to direct Miruro:`, e.message || e);
+    }
+  }
+  const targetId = await findEpisodeTarget(anilistId, provider, category, slug);
+  return fetchSources(targetId, provider, anilistId, category);
+}
+
+async function fetchDownloadForSlug(provider: string, anilistId: number, category: string, slug: string): Promise<any> {
+  if (PY_API_BASE) {
+    try {
+      return await pyApiFetch(`/download/${provider}/${anilistId}/${category}/${slug}`);
+    } catch (e: any) {
+      console.error(`[lovely-anime-api] download fetch failed for ${anilistId}/${provider}/${slug}, falling back to direct Miruro:`, e.message || e);
+    }
+  }
+  if (provider === 'auto') {
+    return autoDirectDownload(anilistId, category, slug);
+  }
+  const targetId = await findEpisodeTarget(anilistId, provider, category, slug);
+  const data = await fetchSources(targetId, provider, anilistId, category);
+  return buildDownloadResponse(data, anilistId, provider, targetId);
 }
 
 async function anilistQuery(query: string, variables?: any): Promise<any> {
@@ -634,8 +705,7 @@ router.get('/anime/:anilist_id', async (req, res) => {
     const infoData = await anilistQuery(gql, { id });
     let episodes: any = null;
     try {
-      const rawEps = await fetchRawEpisodes(id);
-      episodes = injectSourceSlugs(rawEps, id);
+      episodes = await fetchEpisodesWithSlugs(id);
     } catch (e: any) {
       episodes = { error: { status: e.status || 500, detail: e.message || 'Failed to fetch episodes' } };
     }
@@ -796,8 +866,8 @@ router.get('/anime/:anilist_id/recommendations', async (req, res) => {
 router.get('/episodes/:anilist_id', async (req, res) => {
   try {
     const id = parseInt(req.params.anilist_id, 10);
-    const data = await fetchRawEpisodes(id);
-    res.json(injectSourceSlugs(data, id));
+    const data = await fetchEpisodesWithSlugs(id);
+    res.json(data);
   } catch (err: any) {
     res.status(err.status || 500).json({ error: err.message || 'Episodes fetch failed', body: err.body });
   }
@@ -814,6 +884,16 @@ router.get('/sources', async (req, res) => {
       return res.status(400).json({ error: 'episodeId, provider, and anilistId are required' });
     }
 
+    if (PY_API_BASE) {
+      try {
+        const qs = `episodeId=${encodeURIComponent(episodeId)}&provider=${encodeURIComponent(provider)}&anilistId=${anilistId}&category=${encodeURIComponent(category)}`;
+        const data = await pyApiFetch(`/sources?${qs}`);
+        return res.json(data);
+      } catch (e: any) {
+        console.error('[lovely-anime-api] sources fetch failed, falling back to direct Miruro:', e.message || e);
+      }
+    }
+
     const data = await fetchSources(episodeId, provider, anilistId, category);
     res.json(data);
   } catch (err: any) {
@@ -828,8 +908,7 @@ router.get('/watch/:provider/:anilist_id/:category/:slug', async (req, res) => {
     const category = req.params.category;
     const slug = req.params.slug;
 
-    const targetId = await findEpisodeTarget(anilistId, provider, category, slug);
-    const data = await fetchSources(targetId, provider, anilistId, category);
+    const data = await fetchSourcesForSlug(provider, anilistId, category, slug);
     res.json(data);
   } catch (err: any) {
     res.status(err.status || 500).json({ error: err.message || 'Watch sources fetch failed' });
@@ -919,14 +998,8 @@ router.get('/download/:provider/:anilist_id/:category/:slug', async (req, res) =
     const category = req.params.category;
     const slug = req.params.slug;
 
-    if (provider === 'auto') {
-      const resp = await autoDirectDownload(anilistId, category, slug);
-      return res.json(resp);
-    }
-
-    const targetId = await findEpisodeTarget(anilistId, provider, category, slug);
-    const data = await fetchSources(targetId, provider, anilistId, category);
-    res.json(buildDownloadResponse(data, anilistId, provider, targetId));
+    const resp = await fetchDownloadForSlug(provider, anilistId, category, slug);
+    res.json(resp);
   } catch (err: any) {
     res.status(err.status || 500).json({ error: err.message || 'Download lookup failed', attempts: err.attempts });
   }
@@ -948,14 +1021,7 @@ router.get('/download/:provider/:anilist_id/:category/:slug/file', async (req, r
     const slug = req.params.slug;
     const quality = req.query.quality as string;
 
-    let resp: any;
-    if (provider === 'auto') {
-      resp = await autoDirectDownload(anilistId, category, slug);
-    } else {
-      const targetId = await findEpisodeTarget(anilistId, provider, category, slug);
-      const data = await fetchSources(targetId, provider, anilistId, category);
-      resp = buildDownloadResponse(data, anilistId, provider, targetId);
-    }
+    const resp = await fetchDownloadForSlug(provider, anilistId, category, slug);
 
     let url = resp.download_url;
     let usedQuality = null;
